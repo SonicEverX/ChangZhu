@@ -1,0 +1,435 @@
+#!/usr/bin/env python
+# encoding: ${encoding}
+# @Time: 2021/6/8 9:59
+# @Auther: Jack
+from pyspark.sql import SparkSession
+
+
+def i_tpos_stay_work_rest_d():
+
+    spark.sql(r'''
+    select nvl(a.lac_ci,b.lac_ci) as lac_ci
+    ,nvl(a.longitude,b.longitude) as longitude
+    ,nvl(a.latitude,b.latitude) as latitude
+    ,nvl(a.cover_area,b.cover_area) as cover_area
+    from bddw_hive_db.i_cdm_lacci_zj a
+    full outer join bddw_hive_db.i_cdm_lacci b
+    on a.lac_ci=b.lac_ci
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_lacci')
+    
+    spark.catalog.cacheTable('temp_i_tpos_stay_work_rest_${taskid}_lacci')
+
+    spark.sql(r'''
+    select bill_no
+    ,lac_ci
+    ,use_date
+    ,date_type as day_type_id
+    ,p_type
+    ,if(p_type in ('1','2','3'), '1', '2') p_type_flag
+    ,'30' as flag
+    ,p_day
+    from bddw_hive_db.i_tpos_stay_lacci_d
+    where p_day <= '${taskid}'
+    and p_day > '${taskid?calDate(-30,'d')}'
+    and (p_type in ('1','2','3') or p_type in ('4','5') and date_type = '1')
+    union all
+    select bill_no
+    ,lac_ci
+    ,use_date
+    ,date_type as day_type_id
+    ,p_type
+    ,if(p_type in ('1','2','3'), '1', '2') p_type_flag
+    ,'10' as flag
+    ,p_day
+    from bddw_hive_db.i_tpos_stay_lacci_d
+    where p_day <= '${taskid}'
+    and p_day > '${taskid?calDate(-10,'d')}'
+    and (p_type in ('1','2','3') or p_type in ('4','5') and date_type = '1')
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_1')
+
+    print('step 1 is ok')
+
+    spark.sql(r'''
+    select a.flag
+    ,a.p_type
+    ,a.p_type_flag
+    ,a.bill_no
+    ,a.lac_ci
+    ,b.longitude
+    ,b.latitude
+    ,a.use_date
+    ,a.day_list
+    from(select flag
+        ,bill_no
+        ,lac_ci
+        ,p_type
+        ,p_type_flag
+        ,sum(use_date) as use_date
+        ,concat_ws(',',collect_set(concat(p_day,'_',p_type)))as day_list
+        from temp_i_tpos_stay_work_rest_${taskid}_1
+        group by flag
+        ,bill_no
+        ,lac_ci
+        ,p_type
+        ,p_type_flag
+        ) a
+    join temp_i_tpos_stay_work_rest_${taskid}_lacci b
+    on a.lac_ci=b.lac_ci
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_2')
+
+    print('step 2 is ok')
+
+    spark.sql(r'''
+    select flag
+    ,p_type_flag
+    ,bill_no
+    ,lac_ci
+    ,longitude
+    ,latitude
+    ,use_date
+    ,day_list
+    ,row_number() over (partition by flag,p_type_flag,bill_no order by use_date desc) as cnt
+    from(select flag
+        ,p_type_flag
+        ,bill_no
+        ,lac_ci
+        ,longitude
+        ,latitude
+        ,sum(use_date) as use_date
+        ,concat_ws('@',collect_set(day_list))as day_list
+        from temp_i_tpos_stay_work_rest_${taskid}_2
+        group by flag
+        ,p_type_flag
+        ,bill_no
+        ,lac_ci
+        ,longitude
+        ,latitude
+        ) a
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_3')
+
+    print('step 3 is ok')
+
+    spark.sql(r'''
+    select a.flag
+    ,a.p_type_flag
+    ,a.bill_no
+    ,a.lac_ci
+    ,c.cover_area
+    ,b.day_list
+    from temp_i_tpos_stay_work_rest_${taskid}_3 a
+    left join temp_i_tpos_stay_work_rest_${taskid}_3 b
+    on a.flag=b.flag
+    and a.p_type_flag=b.p_type_flag
+    and a.bill_no=b.bill_no
+    left join temp_i_tpos_stay_work_rest_${taskid}_lacci c
+    on a.lac_ci=c.lac_ci
+    where a.cnt = 1
+    and (round(2 *asin(sqrt(power(sin((a.latitude*pi()/180.0-b.latitude*pi()/180.0)/2),2)
+	 +cos(a.latitude*pi()/180.0) *cos(b.latitude*pi()/180.0)*power(sin((a.longitude*pi()/180.0
+	 - b.longitude*pi()/180.0)/2),2)))*6378.137*10000)/10000)*1000 <= 500
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_4')
+
+    print('step 4 is ok')
+
+    spark.sql(r'''
+    select flag
+    ,p_type_flag
+    ,bill_no
+    ,lac_ci
+    ,cover_area
+    ,split(tag_new1,'_')[0] as p_day
+    ,split(tag_new1,'_')[1] as p_type
+    from(select flag
+        ,p_type_flag
+        ,bill_no
+        ,lac_ci
+        ,cover_area
+        ,tag_new
+        from temp_i_tpos_stay_work_rest_${taskid}_4
+        lateral view explode(split(day_list,'@')) t1 as tag_new
+        ) a
+    lateral view explode(split(tag_new,',')) t1 as tag_new1
+    group by flag
+    ,p_type_flag
+    ,bill_no
+    ,lac_ci
+    ,cover_area
+    ,split(tag_new1,'_')[0]
+    ,split(tag_new1,'_')[1]
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_5')
+
+    print('step 5 is ok')
+
+    spark.sql(r'''
+    select bill_no
+    ,max(case when flag = '30' and p_type_flag = '2' then lac_ci end) as work_lac_ci
+    ,max(case when flag = '30' and p_type_flag = '2' then cover_area end) as daystay_lacci_type
+    ,max(case when flag = '30' and p_type_flag = '1' then lac_ci end) as stay_lac_ci
+    ,max(case when flag = '30' and p_type_flag = '1' then cover_area end) as nightstay_lacci_type
+    ,sum(case when flag = '30' and p_type = '1' then 1 else 0 end) as open_days
+    ,sum(case when flag = '30' and p_type = '2' then 1 else 0 end) as close_days
+    ,sum(case when flag = '30' and p_type = '3' then 1 else 0 end) as rest_days
+    ,count(distinct case when flag = '30' and p_type_flag = '1' then p_day else null end) as stay_days
+    ,sum(case when flag = '30' and p_type = '4' then 1 else 0 end) as morn_days
+    ,sum(case when flag = '30' and p_type = '5' then 1 else 0 end) as after_days
+    ,count(distinct case when flag = '30' and p_type_flag = '2' then p_day else null end) as work_days
+    ,max(case when flag = '10' and p_type_flag = '2' then lac_ci end) as work_lac_ci2
+    ,max(case when flag = '10' and p_type_flag = '1' then lac_ci end) as stay_lac_ci2
+    ,sum(case when flag = '10' and p_type = '1' then 1 else 0 end) as open_days2
+    ,sum(case when flag = '10' and p_type = '2' then 1 else 0 end) as close_days2
+    ,sum(case when flag = '10' and p_type = '3' then 1 else 0 end) as rest_days2
+    ,count(distinct case when flag = '10' and p_type_flag = '1' then p_day else null end) as stay_days2
+    ,sum(case when flag = '10' and p_type = '4' then 1 else 0 end) as morn_days2
+    ,sum(case when flag = '10' and p_type = '5' then 1 else 0 end) as after_days2
+    ,count(distinct case when flag = '10' and p_type_flag = '2' then p_day else null end) as work_days2   
+    ,count(distinct p_day) as stay_zj_days
+    from temp_i_tpos_stay_work_rest_${taskid}_5
+    where p_day is not null
+    group by bill_no
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_6')
+
+    spark.sql(r'''
+    select bill_no
+    from bddw_hive_db.a_usoc_user_attr_d
+    where p_day = '${ld_taskid}'
+    group by bill_no
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_7')
+
+    df_1 = spark.sql(r'''
+    select a.bill_no
+    ,a.work_lac_ci
+    ,a.stay_lac_ci
+    ,a.open_days
+    ,a.close_days
+    ,a.rest_days
+    ,a.stay_days
+    ,a.morn_days
+    ,a.after_days
+    ,a.work_days
+    ,a.work_lac_ci2
+    ,a.stay_lac_ci2
+    ,a.open_days2
+    ,a.close_days2
+    ,a.rest_days2
+    ,a.stay_days2
+    ,a.morn_days2
+    ,a.after_days2
+    ,a.work_days2
+    ,a.daystay_lacci_type
+    ,a.nightstay_lacci_type
+    from temp_i_tpos_stay_work_rest_${taskid}_6 a
+    left join temp_i_tpos_stay_work_rest_${taskid}_7 b
+    on a.bill_no=b.bill_no
+    where (b.bill_no is null and a.stay_zj_days > 5)
+    or b.bill_no is not null
+    ''')
+
+    df_1.write.saveAsTable('temp_i_tpos_stay_work_rest_${taskid}_result_1')
+
+    spark.catalog.dropTempView('temp_i_tpos_stay_work_rest_${taskid}_1')
+    spark.catalog.dropTempView('temp_i_tpos_stay_work_rest_${taskid}_2')
+    spark.catalog.dropTempView('temp_i_tpos_stay_work_rest_${taskid}_3')
+    spark.catalog.dropTempView('temp_i_tpos_stay_work_rest_${taskid}_4')
+    spark.catalog.dropTempView('temp_i_tpos_stay_work_rest_${taskid}_5')
+    spark.catalog.dropTempView('temp_i_tpos_stay_work_rest_${taskid}_6')
+    spark.catalog.dropTempView('temp_i_tpos_stay_work_rest_${taskid}_7')
+
+
+    spark.sql(r'''
+    select a.bill_no
+    ,a.lac_ci
+    ,a.use_date
+    ,if(a.p_type in ('1','2','3'), '1', '2') p_type_flag
+    ,if(b.weekend_flag='Y' or b.holiday_flag = 'Y','Y','N') as weekend_flag
+    ,a.p_day
+    from bddw_hive_db.i_tpos_stay_lacci_d a
+    left join bddw_hive_db.i_cdm_date b
+    on a.p_day= b.date_id
+    where a.p_day <= '${taskid}'
+    and a.p_day > '${taskid?calDate(-30,'d')}'
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_10')
+
+    print('step 10 is ok')
+
+    spark.sql(r'''
+    select bill_no
+    ,lac_ci
+    ,weekend_flag
+    ,p_type_flag
+    ,sum(use_date) as use_date
+    from temp_i_tpos_stay_work_rest_${taskid}_10
+    group by bill_no
+    ,lac_ci
+    ,weekend_flag
+    ,p_type_flag
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_11')
+
+    spark.catalog.cacheTable('temp_i_tpos_stay_work_rest_${taskid}_11')
+
+    spark.sql(r'''
+    select weekend_flag
+    ,bill_no
+    ,lac_ci
+    ,sum(use_date) as use_date
+    from temp_i_tpos_stay_work_rest_${taskid}_11 a
+    group by weekend_flag
+    ,bill_no
+    ,lac_ci
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_12')
+
+    spark.catalog.cacheTable('temp_i_tpos_stay_work_rest_${taskid}_12')
+
+    spark.sql(r'''
+    select a.weekend_flag
+    ,a.p_type_flag
+    ,a.bill_no
+    ,a.lac_ci
+    ,b.cover_area
+    from(select weekend_flag
+        ,p_type_flag
+        ,bill_no
+        ,lac_ci
+        ,use_date
+        ,row_number() over (partition by bill_no,weekend_flag,p_type_flag order by use_date desc) as cnt
+        from temp_i_tpos_stay_work_rest_${taskid}_11 a
+        ) a
+    join temp_i_tpos_stay_work_rest_${taskid}_lacci b
+    on a.lac_ci=b.lac_ci
+    where a.cnt = 1
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_13')
+
+    spark.sql(r'''
+    select a.weekend_flag
+    ,a.bill_no
+    ,a.lac_ci
+    ,b.cover_area
+    from(select weekend_flag
+        ,bill_no
+        ,lac_ci
+        ,use_date
+        ,row_number() over (partition by bill_no,weekend_flag order by use_date desc) as cnt
+        from temp_i_tpos_stay_work_rest_${taskid}_12 a
+        ) a
+    join temp_i_tpos_stay_work_rest_${taskid}_lacci b
+    on a.lac_ci=b.lac_ci
+    where a.cnt = 1
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_14')
+
+    spark.sql(r'''
+    select a.bill_no
+    ,a.lac_ci
+    ,b.cover_area
+    from(select bill_no
+        ,lac_ci
+        ,sum(use_date) as use_date
+        ,row_number() over (partition by bill_no order by sum(use_date) desc) as cnt
+        from temp_i_tpos_stay_work_rest_${taskid}_12 a
+        group by bill_no
+        ,lac_ci
+        ) a
+    join temp_i_tpos_stay_work_rest_${taskid}_lacci b
+    on a.lac_ci=b.lac_ci
+    where a.cnt = 1
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_15')
+
+    spark.sql(r'''
+    select bill_no
+    ,max(case when weekend_flag = 'N' and p_type_flag = 2 then lac_ci else null end) as work_daystay_lacci
+    ,max(case when weekend_flag = 'N' and p_type_flag = 2 then cover_area else null end) as work_daystay_lacci_type
+    ,max(case when weekend_flag = 'N' and p_type_flag = 1 then lac_ci else null end) as work_nightstay_lacci
+    ,max(case when weekend_flag = 'N' and p_type_flag = 1 then cover_area else null end) as work_nightstay_lacci_type
+    ,max(case when weekend_flag = 'Y' and p_type_flag = 2 then lac_ci else null end) as rest_daystay_lacci
+    ,max(case when weekend_flag = 'Y' and p_type_flag = 2 then cover_area else null end) as rest_daystay_lacci_type
+    ,max(case when weekend_flag = 'Y' and p_type_flag = 1 then lac_ci else null end) as rest_nightstay_lacci
+    ,max(case when weekend_flag = 'Y' and p_type_flag = 1 then cover_area else null end) as rest_nightstay_lacci_type
+    ,max(case when p_type_flag = 4 then lac_ci else null end) as stay_lacci
+    ,max(case when p_type_flag = 4 then cover_area else null end) as stay_lacci_type
+    ,max(case when weekend_flag = 'N' and p_type_flag = 3 then lac_ci else null end) as work_stay_lacci
+    ,max(case when weekend_flag = 'N' and p_type_flag = 3 then cover_area else null end) as work_stay_lacci_type
+    ,max(case when weekend_flag = 'Y' and p_type_flag = 3 then lac_ci else null end) as rest_stay_lacci
+    ,max(case when weekend_flag = 'Y' and p_type_flag = 3 then cover_area else null end) as rest_stay_lacci_type
+    from (select weekend_flag
+        ,p_type_flag
+        ,bill_no
+        ,lac_ci
+        ,cover_area
+        from temp_i_tpos_stay_work_rest_${taskid}_13
+        union all
+        select weekend_flag
+        ,'3' as p_type_flag
+        ,bill_no
+        ,lac_ci
+        ,cover_area
+        from temp_i_tpos_stay_work_rest_${taskid}_14
+        union all
+        select '' as weekend_flag
+        ,'4' as p_type_flag
+        ,bill_no
+        ,lac_ci
+        ,cover_area
+        from temp_i_tpos_stay_work_rest_${taskid}_15
+        ) a
+    group by bill_no
+    ''').createOrReplaceTempView('temp_i_tpos_stay_work_rest_${taskid}_16')
+
+    df_2 = spark.sql(r'''
+    select a.bill_no
+    ,a.work_lac_ci
+    ,a.stay_lac_ci
+    ,a.open_days
+    ,a.close_days
+    ,a.rest_days
+    ,a.stay_days
+    ,a.morn_days
+    ,a.after_days
+    ,a.work_days
+    ,a.work_lac_ci2
+    ,a.stay_lac_ci2
+    ,a.open_days2
+    ,a.close_days2
+    ,a.rest_days2
+    ,a.stay_days2
+    ,a.morn_days2
+    ,a.after_days2
+    ,a.work_days2
+    ,a.daystay_lacci_type
+    ,a.nightstay_lacci_type
+    ,b.work_daystay_lacci
+    ,b.work_daystay_lacci_type
+    ,b.work_nightstay_lacci
+    ,b.work_nightstay_lacci_type
+    ,b.rest_daystay_lacci
+    ,b.rest_daystay_lacci_type
+    ,b.rest_nightstay_lacci
+    ,b.rest_nightstay_lacci_type
+    ,b.stay_lacci
+    ,b.stay_lacci_type
+    ,b.work_stay_lacci
+    ,b.work_stay_lacci_type
+    ,b.rest_stay_lacci
+    ,b.rest_stay_lacci_type
+    from temp_i_tpos_stay_work_rest_${taskid}_result_1 a
+    left join temp_i_tpos_stay_work_rest_${taskid}_16 b
+    on a.bill_no=b.bill_no
+    ''')
+
+    df_2.write.saveAsTable('temp_i_tpos_stay_work_rest_${taskid}_result_23')
+
+def main():
+    i_tpos_stay_work_rest_d()
+
+
+if __name__ == '__main__':
+    # 初始化spark
+    spark = SparkSession.Builder().appName('i_tpos_stay_work_rest_d').enableHiveSupport().getOrCreate()
+    sc = spark.sparkContext
+    # 初始化数据库
+    spark.sql('use ${database}')
+    # 设置日志级别
+    sc.setLogLevel('WARN')
+
+    spark.conf.set("spark.sql.crossJoin.enabled", "true")
+
+    main()
+
+    spark.stop()
